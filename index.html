@@ -224,10 +224,10 @@
 
     <!-- Sidebar Footer -->
     <div class="p-4 border-t border-slate-100 bg-slate-50/70">
-      <div class="flex items-center gap-2.5 text-xs text-slate-600">
-        <span class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0"></span>
+      <div onclick="navigate('backup')" class="cursor-pointer flex items-center gap-2.5 text-xs text-slate-600 hover:opacity-85 transition" title="Clique para configurar sincronização em nuvem">
+        <span id="sidebar-sync-dot" class="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0"></span>
         <div>
-          <p class="font-semibold text-slate-700">Armazenamento Local Ativo</p>
+          <p id="sidebar-storage-title" class="font-semibold text-slate-700">Armazenamento Local Ativo</p>
           <p id="sidebar-sync-time" class="text-[11px] text-slate-500">Salvo automaticamente</p>
         </div>
       </div>
@@ -325,6 +325,14 @@
     // =========================================================================
     const STORAGE_KEY = 'caderno_erros_eduardo_landim_v1';
     const LAST_QUOTE_KEY = 'caderno_erros_last_quote_idx';
+    const SUPABASE_CONFIG_KEY = 'caderno_erros_supabase_config_v1';
+
+    // Opcional: preencha abaixo com sua URL e Anon Key do Supabase para já deixar
+    // todos os aparelhos conectados automaticamente sem precisar digitar na tela:
+    const DEFAULT_SUPABASE_URL = 'https://pwgewzumqmwgkuoasamz.supabase.co';
+    const DEFAULT_SUPABASE_ANON_KEY = 'sb_publishable_yUeB3TRLkyse8-bOI_xN2g_lLFDq-js';
+    const DEFAULT_SUPABASE_ROW_ID = 'eduardo_landim';
+    const SUPABASE_TABLE = 'caderno_sync';
 
     const DEFAULT_SUBJECTS = [
       { id: 'sub-const', name: 'Direito Constitucional', topics: ['Direitos Fundamentais', 'Controle de Constitucionalidade', 'Organização do Estado', 'Poder Legislativo', 'Poder Judiciário'] },
@@ -600,8 +608,32 @@
     }
 
     // =========================================================================
-    // PERSISTÊNCIA (LOCALSTORAGE)
+    // PERSISTÊNCIA HÍBRIDA (LOCALSTORAGE + SUPABASE CLOUD)
     // =========================================================================
+    let cloudSyncState = {
+      status: 'unconfigured', // 'unconfigured' | 'syncing' | 'synced' | 'error'
+      lastSyncedAt: null,
+      errorMsg: null,
+      debounceTimer: null
+    };
+
+    function getSupabaseConfig() {
+      let saved = {};
+      try {
+        const raw = localStorage.getItem(SUPABASE_CONFIG_KEY);
+        if (raw) saved = JSON.parse(raw) || {};
+      } catch (e) {}
+      const url = (saved.url || DEFAULT_SUPABASE_URL || '').trim().replace(/\/+$/, '');
+      const anonKey = (saved.anonKey || DEFAULT_SUPABASE_ANON_KEY || '').trim();
+      const rowId = (saved.rowId || DEFAULT_SUPABASE_ROW_ID || 'eduardo_landim').trim();
+      return {
+        url,
+        anonKey,
+        rowId,
+        enabled: Boolean(url && anonKey)
+      };
+    }
+
     function loadState() {
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
@@ -611,19 +643,21 @@
           state.subjects = Array.isArray(parsed.subjects) && parsed.subjects.length > 0 ? parsed.subjects : JSON.parse(JSON.stringify(DEFAULT_SUBJECTS));
           state.flashcards = Array.isArray(parsed.flashcards) ? parsed.flashcards.map(normalizeFlashcard) : [];
           state.history = Array.isArray(parsed.history) ? parsed.history : [];
-          state.lastSavedAt = parsed.lastSavedAt || new Date().toISOString();
+          state.lastSavedAt = parsed.lastSavedAt || null;
         } else {
           state.errors = [];
           state.subjects = JSON.parse(JSON.stringify(DEFAULT_SUBJECTS));
           state.flashcards = [];
           state.history = [];
-          state.lastSavedAt = new Date().toISOString();
-          saveState(false);
+          state.lastSavedAt = null;
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
         }
       } catch (e) {
         console.error('Erro ao carregar dados:', e);
         state.subjects = JSON.parse(JSON.stringify(DEFAULT_SUBJECTS));
       }
+      const cfg = getSupabaseConfig();
+      cloudSyncState.status = cfg.enabled ? 'syncing' : 'unconfigured';
       syncSubjectsFromErrors();
       updateBadgesAndSyncUI();
     }
@@ -699,9 +733,171 @@
       state.lastSavedAt = new Date().toISOString();
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-        if (logSync) updateBadgesAndSyncUI();
+        if (logSync) {
+          updateBadgesAndSyncUI();
+          scheduleCloudPush();
+        }
       } catch (e) {
         showToast('Erro ao salvar no navegador. Verifique o espaço disponível.', 'error');
+      }
+    }
+
+    function scheduleCloudPush() {
+      const cfg = getSupabaseConfig();
+      if (!cfg.enabled) return;
+      cloudSyncState.status = 'syncing';
+      updateBadgesAndSyncUI();
+      if (cloudSyncState.debounceTimer) clearTimeout(cloudSyncState.debounceTimer);
+      cloudSyncState.debounceTimer = setTimeout(() => {
+        pushToCloud(false);
+      }, 600);
+    }
+
+    function buildSupabaseHeaders(cfg, extra = {}) {
+      const headers = {
+        'apikey': cfg.anonKey,
+        ...extra
+      };
+      // Chaves legadas JWT (eyJ...) usam Authorization Bearer; chaves novas (sb_publishable_...) usam apenas apikey
+      if (cfg.anonKey.startsWith('eyJ')) {
+        headers['Authorization'] = `Bearer ${cfg.anonKey}`;
+      }
+      return headers;
+    }
+
+    async function pushToCloud(showFeedback = false) {
+      const cfg = getSupabaseConfig();
+      if (!cfg.enabled) {
+        if (showFeedback) showToast('Configure a URL e a Anon Key do Supabase primeiro.', 'warning');
+        return false;
+      }
+      cloudSyncState.status = 'syncing';
+      updateBadgesAndSyncUI();
+      try {
+        const now = state.lastSavedAt || new Date().toISOString();
+        state.lastSavedAt = now;
+        const endpoint = `${cfg.url}/rest/v1/${SUPABASE_TABLE}?on_conflict=id`;
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: buildSupabaseHeaders(cfg, {
+            'Content-Type': 'application/json',
+            'Prefer': 'resolution=merge-duplicates,return=minimal'
+          }),
+          body: JSON.stringify({
+            id: cfg.rowId,
+            data: state,
+            updated_at: now
+          })
+        });
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(errText || `HTTP ${res.status}`);
+        }
+        cloudSyncState.status = 'synced';
+        cloudSyncState.lastSyncedAt = new Date().toISOString();
+        cloudSyncState.errorMsg = null;
+        updateBadgesAndSyncUI();
+        if (currentView === 'backup') renderBackupSettings(document.getElementById('app-content')), lucide.createIcons();
+        if (showFeedback) showToast('Dados enviados e salvos na nuvem Supabase!', 'success');
+        return true;
+      } catch (err) {
+        console.error('Erro ao enviar para o Supabase:', err);
+        cloudSyncState.status = 'error';
+        cloudSyncState.errorMsg = err.message || 'Falha de conexão';
+        updateBadgesAndSyncUI();
+        if (currentView === 'backup') renderBackupSettings(document.getElementById('app-content')), lucide.createIcons();
+        if (showFeedback) showToast('Falha ao salvar na nuvem. Verifique a tabela/chaves do Supabase.', 'error');
+        return false;
+      }
+    }
+
+    async function syncFromCloud({ silent = true, forcePull = false } = {}) {
+      const cfg = getSupabaseConfig();
+      if (!cfg.enabled) {
+        cloudSyncState.status = 'unconfigured';
+        updateBadgesAndSyncUI();
+        if (!silent) showToast('Configure a URL e a Anon Key do Supabase primeiro.', 'warning');
+        return false;
+      }
+      cloudSyncState.status = 'syncing';
+      updateBadgesAndSyncUI();
+      try {
+        const endpoint = `${cfg.url}/rest/v1/${SUPABASE_TABLE}?id=eq.${encodeURIComponent(cfg.rowId)}&select=id,data,updated_at`;
+        const res = await fetch(endpoint, {
+          method: 'GET',
+          headers: buildSupabaseHeaders(cfg, {
+            'Accept': 'application/json'
+          })
+        });
+        if (!res.ok) {
+          const errText = await res.text();
+          throw new Error(errText || `HTTP ${res.status}`);
+        }
+        const rows = await res.json();
+        if (!Array.isArray(rows) || rows.length === 0 || !rows[0].data) {
+          // Nenhum registro na nuvem ainda -> envia os dados locais para inicializar a nuvem
+          const hasLocalData = state.errors.length > 0 || state.flashcards.length > 0;
+          if (hasLocalData || !silent) {
+            await pushToCloud(false);
+            if (!silent) showToast('Conectado! Seus dados locais foram enviados para a nuvem.', 'success');
+          } else {
+            cloudSyncState.status = 'synced';
+            cloudSyncState.lastSyncedAt = new Date().toISOString();
+            cloudSyncState.errorMsg = null;
+            updateBadgesAndSyncUI();
+          }
+          return true;
+        }
+
+        const row = rows[0];
+        const remote = row.data || {};
+        const remoteTime = new Date(row.updated_at || remote.lastSavedAt || 0).getTime();
+        const localTime = state.lastSavedAt ? new Date(state.lastSavedAt).getTime() : 0;
+        const localIsEmpty = state.errors.length === 0 && state.flashcards.length === 0 && state.history.length === 0;
+        const remoteHasData = (Array.isArray(remote.errors) && remote.errors.length > 0) || (Array.isArray(remote.flashcards) && remote.flashcards.length > 0);
+
+        if (forcePull || (localIsEmpty && remoteHasData) || (remoteTime > localTime + 500)) {
+          state.errors = Array.isArray(remote.errors) ? remote.errors.map(normalizeErrorRecord) : [];
+          state.subjects = Array.isArray(remote.subjects) && remote.subjects.length > 0 ? remote.subjects : JSON.parse(JSON.stringify(DEFAULT_SUBJECTS));
+          state.flashcards = Array.isArray(remote.flashcards) ? remote.flashcards.map(normalizeFlashcard) : [];
+          state.history = Array.isArray(remote.history) ? remote.history : [];
+          state.lastSavedAt = remote.lastSavedAt || row.updated_at || new Date().toISOString();
+          syncSubjectsFromErrors();
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+
+          cloudSyncState.status = 'synced';
+          cloudSyncState.lastSyncedAt = new Date().toISOString();
+          cloudSyncState.errorMsg = null;
+          updateBadgesAndSyncUI();
+
+          const anyModalOpen = ['detail-modal', 'review-modal', 'confirm-modal', 'flashcard-modal'].some(mid => {
+            const el = document.getElementById(mid);
+            return el && !el.classList.contains('hidden');
+          });
+          if (!anyModalOpen && currentView !== 'registrar') {
+            navigate(currentView);
+          }
+          if (!silent) showToast(`Sincronizado da nuvem (${state.errors.length} erros, ${state.flashcards.length} flashcards)!`, 'success');
+        } else if (localTime > remoteTime + 500 && !localIsEmpty) {
+          await pushToCloud(false);
+          if (!silent) showToast('Dados locais mais recentes foram enviados para a nuvem!', 'success');
+        } else {
+          cloudSyncState.status = 'synced';
+          cloudSyncState.lastSyncedAt = new Date().toISOString();
+          cloudSyncState.errorMsg = null;
+          updateBadgesAndSyncUI();
+          if (currentView === 'backup') renderBackupSettings(document.getElementById('app-content')), lucide.createIcons();
+          if (!silent) showToast('Tudo atualizado! Nuvem e aparelho estão sincronizados.', 'success');
+        }
+        return true;
+      } catch (err) {
+        console.error('Erro ao buscar dados do Supabase:', err);
+        cloudSyncState.status = 'error';
+        cloudSyncState.errorMsg = err.message || 'Falha de conexão';
+        updateBadgesAndSyncUI();
+        if (currentView === 'backup') renderBackupSettings(document.getElementById('app-content')), lucide.createIcons();
+        if (!silent) showToast('Não foi possível conectar ao Supabase. Verifique a URL, Anon Key e a tabela.', 'error');
+        return false;
       }
     }
 
@@ -731,9 +927,40 @@
 
       const timeStr = state.lastSavedAt ? new Date(state.lastSavedAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : '';
       const headerSync = document.getElementById('header-sync-status');
+      const syncPill = document.getElementById('sync-pill');
       const sidebarSync = document.getElementById('sidebar-sync-time');
-      if (headerSync) headerSync.textContent = timeStr ? `Salvo às ${timeStr}` : 'Salvo localmente';
-      if (sidebarSync) sidebarSync.textContent = timeStr ? `Último salvamento: ${timeStr}` : 'Salvo automaticamente';
+      const sidebarTitle = document.getElementById('sidebar-storage-title');
+      const sidebarDot = document.getElementById('sidebar-sync-dot');
+
+      const cfg = getSupabaseConfig();
+      if (!cfg.enabled) {
+        if (headerSync) headerSync.textContent = timeStr ? `Local (${timeStr})` : 'Salvo localmente';
+        if (syncPill) syncPill.className = 'cursor-pointer hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-100 border border-slate-200 text-slate-700 text-xs font-semibold hover:bg-slate-200 transition';
+        if (sidebarTitle) sidebarTitle.textContent = 'Armazenamento Local Ativo';
+        if (sidebarSync) sidebarSync.textContent = timeStr ? `Salvo local às ${timeStr} • Configurar nuvem` : 'Clique para ativar nuvem';
+        if (sidebarDot) sidebarDot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-500 shrink-0';
+      } else if (cloudSyncState.status === 'syncing') {
+        if (headerSync) headerSync.textContent = 'Sincronizando nuvem...';
+        if (syncPill) syncPill.className = 'cursor-pointer hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-semibold hover:bg-indigo-100 transition';
+        if (sidebarTitle) sidebarTitle.textContent = 'Sincronizando com Supabase...';
+        if (sidebarSync) sidebarSync.textContent = 'Atualizando banco na nuvem';
+        if (sidebarDot) sidebarDot.className = 'w-2.5 h-2.5 rounded-full bg-indigo-500 animate-ping shrink-0';
+      } else if (cloudSyncState.status === 'error') {
+        if (headerSync) headerSync.textContent = 'Salvo local (Nuvem offline)';
+        if (syncPill) syncPill.className = 'cursor-pointer hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full bg-amber-50 border border-amber-200 text-amber-800 text-xs font-semibold hover:bg-amber-100 transition';
+        if (sidebarTitle) sidebarTitle.textContent = 'Salvo Local (Erro na Nuvem)';
+        if (sidebarSync) sidebarSync.textContent = 'Clique para verificar conexão';
+        if (sidebarDot) sidebarDot.className = 'w-2.5 h-2.5 rounded-full bg-amber-500 shrink-0';
+      } else {
+        const syncTimeStr = cloudSyncState.lastSyncedAt
+          ? new Date(cloudSyncState.lastSyncedAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })
+          : timeStr;
+        if (headerSync) headerSync.textContent = syncTimeStr ? `Nuvem sincronizada (${syncTimeStr})` : 'Nuvem conectada';
+        if (syncPill) syncPill.className = 'cursor-pointer hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs font-semibold hover:bg-emerald-100 transition';
+        if (sidebarTitle) sidebarTitle.textContent = 'Nuvem Supabase Conectada';
+        if (sidebarSync) sidebarSync.textContent = syncTimeStr ? `Sincronizado às ${syncTimeStr}` : 'Sincronização automática ativa';
+        if (sidebarDot) sidebarDot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0';
+      }
     }
 
     // =========================================================================
@@ -3529,6 +3756,15 @@
       loadState();
       pickMotivationalQuote(false);
       navigate('dashboard');
+      // Sincroniza automaticamente com o Supabase ao abrir o aplicativo
+      syncFromCloud({ silent: true });
+    });
+
+    // Sincroniza automaticamente ao voltar para a aba/aplicativo no celular ou PC
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && getSupabaseConfig().enabled) {
+        syncFromCloud({ silent: true });
+      }
     });
   </script>
 </body>
