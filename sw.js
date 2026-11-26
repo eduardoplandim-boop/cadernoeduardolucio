@@ -1,4 +1,4 @@
-const CACHE_NAME = 'caderno-erros-v2';
+const CACHE_NAME = 'caderno-erros-v3';
 const ASSETS = [
   './',
   './index.html',

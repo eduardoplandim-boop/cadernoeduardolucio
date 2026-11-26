@@ -595,8 +595,9 @@
       modal.classList.remove('hidden');
       modal.classList.add('flex');
       document.getElementById('confirm-ok-btn').onclick = () => {
+        const cb = confirmCallback;
         closeConfirmModal();
-        if (typeof confirmCallback === 'function') confirmCallback();
+        if (typeof cb === 'function') cb();
       };
     }
 
@@ -853,10 +854,10 @@
         const remote = row.data || {};
         const remoteTime = new Date(row.updated_at || remote.lastSavedAt || 0).getTime();
         const localTime = state.lastSavedAt ? new Date(state.lastSavedAt).getTime() : 0;
-        const localIsEmpty = state.errors.length === 0 && state.flashcards.length === 0 && state.history.length === 0;
+        const localNeverSaved = !state.lastSavedAt;
         const remoteHasData = (Array.isArray(remote.errors) && remote.errors.length > 0) || (Array.isArray(remote.flashcards) && remote.flashcards.length > 0);
 
-        if (forcePull || (localIsEmpty && remoteHasData) || (remoteTime > localTime + 500)) {
+        if (forcePull || (localNeverSaved && remoteHasData) || (remoteTime > localTime + 500)) {
           state.errors = Array.isArray(remote.errors) ? remote.errors.map(normalizeErrorRecord) : [];
           state.subjects = Array.isArray(remote.subjects) && remote.subjects.length > 0 ? remote.subjects : JSON.parse(JSON.stringify(DEFAULT_SUBJECTS));
           state.flashcards = Array.isArray(remote.flashcards) ? remote.flashcards.map(normalizeFlashcard) : [];
@@ -878,7 +879,7 @@
             navigate(currentView);
           }
           if (!silent) showToast(`Sincronizado da nuvem (${state.errors.length} erros, ${state.flashcards.length} flashcards)!`, 'success');
-        } else if (localTime > remoteTime + 500 && !localIsEmpty) {
+        } else if (localTime > remoteTime + 500) {
           await pushToCloud(false);
           if (!silent) showToast('Dados locais mais recentes foram enviados para a nuvem!', 'success');
         } else {
@@ -3108,14 +3109,19 @@ create policy "Acesso publico ao caderno"
     function confirmClearAllData() {
       openConfirmModal(
         'Apagar todos os registros?',
-        'Isso removerá todos os erros cadastrados e o histórico deste navegador. Recomendamos exportar um backup JSON antes.',
-        () => {
+        'Isso removerá todos os erros, flashcards e o histórico deste navegador e da nuvem. Recomendamos exportar um backup JSON antes.',
+        async () => {
           state.errors = [];
           state.flashcards = [];
           state.history = [];
-          saveState();
+          state.subjects = JSON.parse(JSON.stringify(DEFAULT_SUBJECTS));
+          if (cloudSyncState.debounceTimer) clearTimeout(cloudSyncState.debounceTimer);
+          state.lastSavedAt = new Date().toISOString();
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          updateBadgesAndSyncUI();
           showToast('Todos os registros foram apagados.', 'info');
           navigate('dashboard');
+          await pushToCloud(false);
         }
       );
     }
