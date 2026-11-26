@@ -2792,12 +2792,185 @@
     // =========================================================================
     // VIEW 7: BACKUP E CONFIGURAÇÕES
     // =========================================================================
+    function getSupabaseSetupSQL() {
+      return `create table if not exists public.caderno_sync (
+  id text primary key,
+  data jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.caderno_sync enable row level security;
+
+drop policy if exists "Acesso publico ao caderno" on public.caderno_sync;
+create policy "Acesso publico ao caderno"
+  on public.caderno_sync
+  for all
+  to anon, authenticated
+  using (true)
+  with check (true);`;
+    }
+
+    function copySupabaseSQL() {
+      const sql = getSupabaseSetupSQL();
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(sql).then(() => {
+          showToast('Comando SQL copiado! Cole no SQL Editor do Supabase e clique em Run.', 'success');
+        }).catch(() => {
+          showToast('Copie o código SQL exibido na caixa.', 'info');
+        });
+      } else {
+        showToast('Copie o código SQL exibido na caixa.', 'info');
+      }
+    }
+
+    async function handleSaveSupabaseConfig(event) {
+      event.preventDefault();
+      const url = document.getElementById('sb-url-input').value.trim().replace(/\/+$/, '');
+      const anonKey = document.getElementById('sb-key-input').value.trim();
+      const rowId = (document.getElementById('sb-rowid-input').value.trim() || 'eduardo_landim');
+
+      if (!url || !anonKey) {
+        return showToast('Preencha a Project URL e a Anon Public Key do Supabase.', 'warning');
+      }
+      if (!/^https?:\/\//i.test(url)) {
+        return showToast('A URL do projeto deve começar com https://', 'error');
+      }
+
+      localStorage.setItem(SUPABASE_CONFIG_KEY, JSON.stringify({ url, anonKey, rowId }));
+      showToast('Configuração salva! Testando conexão com o Supabase...', 'info');
+      await syncFromCloud({ silent: false, forcePull: false });
+      if (currentView === 'backup') {
+        renderBackupSettings(document.getElementById('app-content'));
+        lucide.createIcons();
+      }
+    }
+
+    function disconnectSupabaseConfig() {
+      openConfirmModal(
+        'Desconectar nuvem neste aparelho?',
+        'Seus erros e flashcards continuarão salvos localmente neste navegador, mas deixarão de sincronizar com o Supabase até você reconectar.',
+        () => {
+          localStorage.removeItem(SUPABASE_CONFIG_KEY);
+          cloudSyncState.status = getSupabaseConfig().enabled ? 'synced' : 'unconfigured';
+          cloudSyncState.errorMsg = null;
+          updateBadgesAndSyncUI();
+          showToast('Sincronização em nuvem desconectada neste aparelho.', 'info');
+          renderBackupSettings(document.getElementById('app-content'));
+          lucide.createIcons();
+        }
+      );
+    }
+
     function renderBackupSettings(container) {
+      const cfg = getSupabaseConfig();
+      const hasHardcodedDefaults = Boolean(DEFAULT_SUPABASE_URL && DEFAULT_SUPABASE_ANON_KEY);
+      const statusBadge = !cfg.enabled
+        ? '<span class="px-2.5 py-1 rounded-full bg-slate-100 text-slate-700 border border-slate-200 text-xs font-bold">⚪ Não configurado (Apenas Local)</span>'
+        : cloudSyncState.status === 'syncing'
+          ? '<span class="px-2.5 py-1 rounded-full bg-indigo-100 text-indigo-800 border border-indigo-200 text-xs font-bold">🔄 Sincronizando...</span>'
+          : cloudSyncState.status === 'error'
+            ? '<span class="px-2.5 py-1 rounded-full bg-amber-100 text-amber-800 border border-amber-200 text-xs font-bold">⚠️ Erro de Conexão</span>'
+            : '<span class="px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200 text-xs font-bold">🟢 Conectado ao Supabase</span>';
+
       container.innerHTML = `
         <div class="max-w-4xl mx-auto space-y-6 fade-in">
           <div>
             <h2 class="text-xl sm:text-2xl font-extrabold text-slate-900">Backup e Configurações</h2>
-            <p class="text-sm text-slate-500">Seus dados ficam salvos automaticamente neste navegador (localStorage). Exporte backups JSON regularmente para transferir entre computador e celular.</p>
+            <p class="text-sm text-slate-500">Sincronize automaticamente seus erros e flashcards entre celular, tablet e computador com o Supabase ou exporte backups em JSON.</p>
+          </div>
+
+          <!-- Sincronização em Nuvem (Supabase) -->
+          <div class="card-premium p-5 sm:p-6 border-2 border-indigo-100 space-y-5">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div class="flex items-start gap-3">
+                <div class="w-11 h-11 rounded-xl gradient-brand text-white flex items-center justify-center shadow-sm shrink-0">
+                  <i data-lucide="cloud" class="w-5 h-5"></i>
+                </div>
+                <div>
+                  <h3 class="font-extrabold text-slate-900 text-base sm:text-lg">Sincronização em Nuvem Multi-Dispositivo (Supabase)</h3>
+                  <p class="text-xs text-slate-500 mt-0.5">Acesse e atualize o mesmo histórico de erros, Segundo Ciclo e Flashcards em qualquer aparelho.</p>
+                </div>
+              </div>
+              ${statusBadge}
+            </div>
+
+            ${cloudSyncState.status === 'error' && cloudSyncState.errorMsg ? `
+              <div class="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800">
+                <strong>Detalhe do erro:</strong> ${escapeHTML(cloudSyncState.errorMsg)}
+                <p class="mt-1 text-rose-700">Verifique se você executou o comando SQL abaixo no painel do Supabase para criar a tabela <code>caderno_sync</code>.</p>
+              </div>
+            ` : ''}
+
+            <form onsubmit="handleSaveSupabaseConfig(event)" class="space-y-4">
+              <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div class="md:col-span-2">
+                  <label class="block text-xs font-bold uppercase tracking-wide text-slate-700 mb-1">1. Project URL do Supabase *</label>
+                  <input type="url" id="sb-url-input" value="${escapeHTML(cfg.url)}" required placeholder="https://seuprojeto.supabase.co" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+                </div>
+                <div>
+                  <label class="block text-xs font-bold uppercase tracking-wide text-slate-700 mb-1">2. ID do Caderno *</label>
+                  <input type="text" id="sb-rowid-input" value="${escapeHTML(cfg.rowId)}" required placeholder="eduardo_landim" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm outline-none focus:ring-2 focus:ring-indigo-500" />
+                </div>
+              </div>
+
+              <div>
+                <label class="block text-xs font-bold uppercase tracking-wide text-slate-700 mb-1">3. Chave Pública (anon / publishable key) *</label>
+                <input type="password" id="sb-key-input" value="${escapeHTML(cfg.anonKey)}" required placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9... ou sb_publishable_..." class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-sm font-mono outline-none focus:ring-2 focus:ring-indigo-500" />
+                <div class="flex items-center justify-between mt-1">
+                  <span class="text-[11px] text-slate-400">Encontrada em Project Settings → API no painel do Supabase.</span>
+                  <button type="button" onclick="const el=document.getElementById('sb-key-input'); el.type = el.type === 'password' ? 'text' : 'password';" class="text-[11px] font-bold text-indigo-600 hover:underline">Mostrar/ocultar chave</button>
+                </div>
+              </div>
+
+              <div class="flex flex-wrap items-center justify-between gap-3 pt-2">
+                <div class="flex flex-wrap items-center gap-2">
+                  <button type="submit" class="px-5 py-2.5 rounded-xl gradient-brand text-white font-extrabold text-xs sm:text-sm shadow-sm hover:opacity-95 flex items-center gap-2">
+                    <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+                    Salvar e Sincronizar Agora
+                  </button>
+                  ${cfg.enabled ? `
+                    <button type="button" onclick="syncFromCloud({ silent: false, forcePull: true })" class="px-3.5 py-2.5 rounded-xl border border-indigo-200 bg-indigo-50 text-indigo-700 font-bold text-xs hover:bg-indigo-100 flex items-center gap-1.5" title="Substituir dados locais pelos dados que estão no Supabase">
+                      <i data-lucide="cloud-download" class="w-4 h-4"></i>
+                      Baixar da Nuvem
+                    </button>
+                    <button type="button" onclick="pushToCloud(true)" class="px-3.5 py-2.5 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-800 font-bold text-xs hover:bg-emerald-100 flex items-center gap-1.5" title="Forçar envio dos dados deste aparelho para o Supabase">
+                      <i data-lucide="cloud-upload" class="w-4 h-4"></i>
+                      Enviar para Nuvem
+                    </button>
+                  ` : ''}
+                </div>
+
+                ${cfg.enabled && !hasHardcodedDefaults ? `
+                  <button type="button" onclick="disconnectSupabaseConfig()" class="px-3 py-2 rounded-xl text-rose-600 hover:bg-rose-50 text-xs font-bold">
+                    Desconectar
+                  </button>
+                ` : ''}
+              </div>
+            </form>
+
+            <!-- Passo a passo + SQL para criar a tabela no Supabase -->
+            <details class="rounded-xl bg-slate-50 border border-slate-200 p-4 text-xs text-slate-700">
+              <summary class="font-extrabold text-indigo-700 cursor-pointer select-none flex items-center justify-between">
+                <span>📋 Como configurar seu banco gratuito no Supabase em 1 minuto (Comando SQL incluso)</span>
+                <span class="text-[11px] font-semibold text-slate-400">Clique para abrir</span>
+              </summary>
+              <div class="mt-3 space-y-3 leading-relaxed">
+                <ol class="list-decimal list-inside space-y-1.5 text-slate-700">
+                  <li>Crie uma conta gratuita em <strong>supabase.com</strong> e clique em <strong>New Project</strong>.</li>
+                  <li>No menu lateral esquerdo do Supabase, clique em <strong>SQL Editor</strong> → <strong>New query</strong>.</li>
+                  <li>Copie o comando SQL abaixo, cole lá e clique em <strong>Run</strong> (isso cria a tabela <code>caderno_sync</code>):</li>
+                </ol>
+                <div class="relative">
+                  <pre class="p-3 rounded-xl bg-slate-900 text-emerald-300 font-mono text-[11px] overflow-x-auto leading-normal">${escapeHTML(getSupabaseSetupSQL())}</pre>
+                  <button type="button" onclick="copySupabaseSQL()" class="absolute top-2.5 right-2.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[11px] shadow-sm">
+                    Copiar SQL
+                  </button>
+                </div>
+                <p class="text-slate-600">
+                  4. Depois, vá em <strong>Project Settings (ícone de engrenagem) → Data API / API Keys</strong>, copie a <strong>Project URL</strong> e a chave <strong>anon / public</strong> e cole nos campos acima (ou fixe nas constantes <code>DEFAULT_SUPABASE_URL</code> e <code>DEFAULT_SUPABASE_ANON_KEY</code> no início do arquivo <code>index.html</code> para já vir conectado em qualquer aparelho).
+                </p>
+              </div>
+            </details>
           </div>
 
           <div class="grid grid-cols-1 md:grid-cols-2 gap-5">
